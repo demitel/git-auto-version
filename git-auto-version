@@ -1,0 +1,372 @@
+#!/usr/bin/perl
+#
+# git-auto-version: tool to automatically build version number from git
+# MIT License
+# 
+# Copyright (c) 2024 Denis Sirotkin <denis@demitel.ru>
+# 
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+# 
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+# 
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+#######################################################################
+
+use warnings;
+use strict;
+use File::Basename;
+
+my $topLevel;
+my $name;
+my $branch;
+my $postcommit = '.git/hooks/post-commit';
+my $versionFile = 'VERSION';
+my %suffixes = ('fix' => 'fix', 'develop' => 'dev', 'rc' => 'rc');
+my $tagPrefix = 'v';
+my $tagPattern = $tagPrefix . '[[:digit:]]*';
+my $gitDefault = 'g0000000';
+
+sub describe
+{
+    my ($commit) = @_;
+    $commit ||= '';
+    my $describe = `git describe --first-parent --long --match $tagPattern $commit 2>/dev/null` || $tagPrefix . '0-0-' . $gitDefault;
+    # return: (tag, commits, git)
+    # tag without leading prefix!!!
+    return $describe =~ m!^$tagPrefix(.*)-(\d+)-(g.*)$!;
+}
+
+sub versionFromTag
+{
+    my ($tag) = @_;
+    return ($tag =~ m!^(.*)-!)[0];
+}
+
+sub dirtyTime
+{
+    my $dirtyTime = 0;
+    foreach my $file (`git status --porcelain`) {
+        chomp $file;
+        $file =~ s/^.{3}//;
+        my $time = (stat($file))[9];
+        $dirtyTime = $time if ($time > $dirtyTime);
+    }
+    my $lastCommitTime = `git log -1 --format=%ct 2>/dev/null` || $dirtyTime;
+    return $dirtyTime ? '+d' . ($dirtyTime - $lastCommitTime) : '';
+}
+
+sub version
+{
+    my ($clean) = @_;
+    my ($tag, $commits, $git) = describe;
+    my ($version, $suffix, $tagLocal) = split /-/, $tag;
+    $tagLocal ||= '';
+    if (!$suffix) {
+        # Tag has no suffix, try to get it from branch
+        my ($b, $ver) = $branch =~ m!^(.*?)-(.*?)$!;
+        if ($suffix = $suffixes{$b || $branch}) {
+            chomp(my $fork = `git merge-base --fork-point master`);
+            chomp($commits = `git rev-list $fork..HEAD --count`);
+            $version = $ver || '0.0';
+        }
+    } else {
+        $commits++;
+    }
+    my $suffixVer = '';
+    my $dirtyTime = $clean ? '' : dirtyTime;
+    if ($suffix) {
+        if ($suffix eq $suffixes{'fix'}) {
+            $suffixVer = '.' . $commits;
+        } elsif ($suffix eq $suffixes{'rc'}) {
+            $suffixVer = '.0~' . $commits;
+        } elsif ($suffix eq $suffixes{'develop'}) {
+            my $tag = $tagPrefix . $tag;
+            if (!$tagLocal) {
+                # Tag has no local, try to get it from branch
+                my $local;
+                if ((my $ver, $local) = $branch =~ m!^develop-(\d.*?)-(.*)$!) {
+                    # Branch is develop and it has a local and a version
+                    die "Branch's version does not match tag's one!\n" if ($version ne $ver);
+                } else {
+                    # Branch is develop and it has a local but no version
+                    ($local) = $branch =~ m!^develop-([^\d].*)$!;
+                }
+                if (defined $local && (!$tagLocal || $tagLocal ne $local)) {
+                    # Tag is not in compliance with branch
+                    $tagLocal = $local;
+                    $tag = 'HEAD';
+                }
+            }
+            if ($tagLocal) {
+                my ($parentBranch) = $branch =~ m!^(.*)-$tagLocal!;
+                my $parentHash = `git merge-base --fork-point $parentBranch`;
+                my ($parentTag, $parentCommits, $parentGit) = describe $parentHash;
+                $parentCommits++;
+                my $parentTime = `git log -1 --format=%ct $parentHash`;
+                my $time = `git log -1 --format=%ct HEAD` - $parentTime;
+                $suffixVer = "~$parentCommits.$parentGit";
+                $tagLocal = "+c$time.$tagLocal";
+            } else {
+                $suffixVer = "~$commits";
+            }
+        }
+    } else {
+        $suffix = '';
+        if (my ($major, $minor) = $version =~ m!^(\d+).(\d+)!) {
+            $version = $major . '.' . ($minor + $commits);
+        } else {
+            $version .= '.' . $commits;
+        }
+    }
+    $git = ".$git";
+    return wantarray ? ($version, $suffixVer, $tagLocal, $git, $dirtyTime, $suffix) : $version . $suffixVer . $tagLocal . $git . $dirtyTime;
+}
+
+sub cmdHelp
+{
+    print "Usage: $name [command]\n";
+    print "Will print current version if no command specified\n";
+    print "Commands:\n";
+    print "  help                  - print this help\n";
+    print "  init                  - init new repo and create $postcommit\n";
+    print "  fix                   - create new branch fix-<current version> for fixes\n";
+    print "  develop [new version] - create new branch develop-<new version> for development\n";
+    print "  feature <feature>     - create new feature develop-<version>-<feature>\n";
+    print "  rc [new version]      - create new branch rc-<current version> for release\n";
+    print "  rc from <develop-VER> - create new branch rc-<VER> for release\n";
+    print "  release from <rc-VER> - merge RC branch\n";
+    print "  mktag [num]           - create tag\n";
+    print "  mkversion [num]       - create main version tag\n";
+    print "  archive [name]        - create archive name-<current version>.tgz\n";
+    print "\n";
+    print "Versioninig hints:\n";
+    print "  master:  tag vM           => M.N\n";
+    print "  fix:     tag vM.N-fix     => M.N.FIX\n";
+    print "  rc:      tag vM.N-rc      => M.N.0~RC\n";
+    print "  develop: tag vM.N-dev     => M.N~DEV\n";
+    print "  feature: tag vM.N-dev-(*) => M.N~DEV.GIT+TIME.(*)\n";
+    print "                            => .GIT[+DIRTY_TIME]\n";
+}
+
+sub cmdInstall
+{
+    my $file = "$topLevel/$postcommit";
+    if (! -e $file) {
+        print "Create $postcommit file\n";
+        open F, "> $file" || die "Cant open file $!\n";
+        print F "#!/bin/sh\n\n# Create tag on first commit in fix/develop/rc brunch\n$name mktag\n";
+        close F;
+        chmod 0755, $postcommit;
+    }
+}
+
+sub cmdInit
+{
+    system("git init");
+}
+
+sub commitWarning
+{
+    if (! -e "$topLevel/$postcommit") {
+        print "! You must run '$name mktag` after first commit.\n";
+        print "! Or you can create $postcommit.\n";
+    }
+}
+
+sub cmdFix
+{
+    die "Only master can be fixed!\n" if ($branch ne 'master');
+    my ($ver) = version();
+    system("git switch -c fix-$ver");
+    commitWarning;
+}
+
+sub cmdDevelop
+{
+    my ($ver) = @_;
+    die "Only master can be forked for development!\n" if ($branch ne 'master');
+    die "No version!\n" if (!$ver);
+    system("git switch -c develop-$ver");
+    commitWarning;
+}
+
+sub cmdFeature
+{
+    my ($local) = @_;
+    die "Only develop can be forked for feature development!\n" if ($branch !~ m!^develop!);
+    die "No local modificator!\n" if (!$local);
+    chomp(my $fork = `git merge-base --fork-point master`);
+    chomp(my $commits = `git rev-list $fork..HEAD --count`);
+    die "Branch $branch must have at least one commit!\n" if !$commits;
+    system("git switch -c $branch-$local");
+    commitWarning;
+}
+
+sub cmdRc
+{
+    my ($ver, $from) = @_;
+    if ($ver eq 'from') {
+        die "No develop branch!\n" if (!$from);
+        die "Not a develop branch!\n" if ($from !~ m!^develop!);
+        $ver = versionFromTag((describe($from))[0]);
+    }
+    die "No version!\n" if (!$ver);
+    if ($branch =~ m!^rc-!) {
+        my ($version) = $branch =~ m!^rc-(.*)$!;
+        system("git branch -M rc-$ver") if ($version ne $ver);
+    } else {
+        die "Only master can be forked to release candidate!\n" if ($branch ne 'master');
+        system("git switch -c rc-$ver");
+    }
+    system("git merge --no-ff $from");
+    my ($tag) = describe;
+    createTag($ver . '-' . $suffixes{'rc'}) if ($tag ne $ver);
+    commitWarning;
+}
+
+sub createTag
+{
+    my $newTag = $tagPrefix . shift;
+    print "* Create tag [$newTag]\n";
+    system("git tag -a $newTag -m \"$newTag\"");
+}
+
+sub cmdRelease
+{
+    my ($cmd, $from) = @_;
+    die "Only master can be merged with release candidate!\n" if ($branch ne 'master');
+    die "Wrong command!\n" if ($cmd ne 'from');
+    die "No rc branch!\n" if (!$from);
+    if (my ($ver) = $from =~ m!^rc-(.*)!) {
+        system("git merge --no-ff $from");
+        $ver =~ s!\.0$!!;
+        my ($tag) = describe;
+        createTag($ver) if ($tag ne $ver);
+    } else {
+        die "Not a rc branch!\n";
+    }
+    commitWarning;
+}
+
+sub cmdMkVersion
+{
+    die "Only master can have main version tag!\n" if ($branch ne 'master');
+    my $version = shift;
+    if (defined $version && (my ($ver) = $version =~ m!^(\d+)$!)) {
+        createTag($ver);
+    }
+}
+
+sub cmdMkTag
+{
+    my ($newTag) = @_;
+    my ($tag, $commits, $git) = describe;
+    if ($branch eq 'master' && $git eq $gitDefault) {
+        cmdMkVersion(0);
+        return;
+    }
+    my ($version, $tagSuffix, $tagLocal) = split /-/, $tag;
+    $version =~ s!^$tagPrefix!!;
+    if (defined $tagSuffix) {
+        # There is a suffix in tag
+        if ($tagSuffix eq $suffixes{'develop'}) {
+            my $local;
+            if ((my $ver, $local) = $branch =~ m!^develop-(\d.*?)-(.*)$!) {
+                # Branch is develop and it has a local and a version
+                die "Branch's version does not match tag's one!\n" if ($version ne $ver);
+            } else {
+                # Branch is develop and it has a local but no version
+                (($local) = $branch =~ m!^develop-([^\d].*)$!);
+            }
+            if (defined $local && (!defined $tagLocal || $tagLocal ne $local)) {
+                # Tag is not in compliance with branch
+                # Append local to current tag
+                $newTag = $version . '-' . $tagSuffix . '-' . $local;
+            }
+        } elsif ($tagSuffix eq $suffixes{'rc'}) {
+            my ($ver) = $branch =~ m!^rc-(.*)$!;
+            $newTag = $ver . '-' . $tagSuffix if ($version ne $ver);
+        }
+    } else {
+        # Tag has no suffix, only version
+        if (my ($branch, $ver) = $branch =~ m!^(.*?)-(.*?)$!) {
+            # Branch has a version
+            if (my $suffix = $suffixes{$branch}) {
+                # Tag must have suffix
+                $newTag = $ver . '-' . $suffix;
+            }
+        }
+    }
+    createTag($newTag) if (defined $newTag);
+}
+
+sub cmdArchive
+{
+    my $commit = shift || 'HEAD';
+    my $name = shift || '';
+    my $version = version "clean";
+    chomp(my $date = `git log -1 --format=%cI`);
+    chomp(my $timestamp = `git log -1 --format=%ct`);
+    $name .= '-' if ($name);
+    my $versionFileContent = 'ARCHIVE_GIT_VERSION=' . $version . "\n";
+    $versionFileContent .= 'ARCHIVE_GIT_DATE=' . $date . "\n";
+    $versionFileContent .= 'ARCHIVE_GIT_TIMESTAMP=' . $timestamp . "\n";
+    system("git archive --add-virtual-file $versionFile:\"$versionFileContent\" --format tgz -o ../$name$version.tgz $commit");
+}
+
+$name = basename($0);
+$name =~ s!-! !;
+my $command = shift @ARGV || '';
+
+chomp($topLevel = `git rev-parse --show-toplevel 2>/dev/null`);
+if ($topLevel eq '') {
+    if ($command eq 'init') {
+        cmdInit;
+        $topLevel = '.';
+    } else {
+        print "You must run it in git tree!\n\n";
+        cmdHelp;
+        die "\n";
+    }
+}
+
+chomp($branch = `git branch --show-current`);
+
+if ($command eq 'help') {
+    cmdHelp;
+} elsif ($command eq 'init') {
+    cmdInstall;
+} elsif ($command eq 'fix') {
+    cmdFix;
+} elsif ($command eq 'develop') {
+    cmdDevelop @ARGV;
+} elsif ($command eq 'feature') {
+    cmdFeature @ARGV;
+} elsif ($command eq 'rc') {
+    cmdRc @ARGV;
+} elsif ($command eq 'release') {
+    cmdRelease @ARGV;
+} elsif ($command eq 'mktag') {
+    cmdMkTag @ARGV;
+} elsif ($command eq 'mkversion') {
+    cmdMkVersion @ARGV;
+} elsif ($command eq 'archive') {
+    cmdArchive @ARGV;
+} elsif ($command eq '') {
+    print version . "\n";
+} else {
+    cmdHelp;
+    die "Unknown command\n";
+}
